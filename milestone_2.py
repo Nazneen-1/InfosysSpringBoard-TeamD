@@ -1,11 +1,13 @@
 import cv2
 import mediapipe as mp
 import tkinter as tk
-from tkinter import ttk, simpledialog
+from tkinter import ttk
 from PIL import Image, ImageTk
 import math
 import threading
 import time
+import queue
+
 
 class GestureRecognitionApp:
     def __init__(self, root):
@@ -24,15 +26,22 @@ class GestureRecognitionApp:
 
         self.distance_mm = 0
         self.gesture_name = "Unknown"
-        self.focal_length = 800  # tunable in Settings
+        self.focal_length = 800
 
         # Gesture thresholds (mm)
-        self.open_hand_dist  = 80
-        self.pinch_dist_min  = 20
-        self.pinch_dist_max  = 60
-        self.closed_dist     = 20
+        self.open_hand_dist = 80
+        self.pinch_dist_min = 20
+        self.pinch_dist_max = 60
+        self.closed_dist    = 20
+
+        # ── Thread-safe frame queue ──────────────────────────
+        # Only keep the latest frame to avoid memory build-up
+        self.frame_queue = queue.Queue(maxsize=1)
 
         self.build_ui()
+
+        # Start the UI refresh loop (runs on main thread via after())
+        self._schedule_ui_update()
 
     # ──────────────────────────────────────────────
     # UI
@@ -106,7 +115,7 @@ class GestureRecognitionApp:
         tk.Label(dist_card, text="millimeters",
                  font=("Arial", 10), fg="#888", bg="white").pack()
 
-        # Slider (read-only visual indicator)
+        # Slider — always enabled, value set from main thread
         slider_frame = tk.Frame(dist_card, bg="white")
         slider_frame.pack(fill="x", padx=15, pady=(8, 4))
 
@@ -114,8 +123,7 @@ class GestureRecognitionApp:
         tk.Label(slider_frame, text="50mm",  font=("Arial", 7), bg="white", fg="#aaa").pack(side="left", expand=True)
         tk.Label(slider_frame, text="100mm", font=("Arial", 7), bg="white", fg="#aaa").pack(side="right")
 
-        self.dist_slider = ttk.Scale(dist_card, from_=0, to=150,
-                                     orient="horizontal", state="disabled")
+        self.dist_slider = ttk.Scale(dist_card, from_=0, to=150, orient="horizontal")
         self.dist_slider.pack(fill="x", padx=15, pady=(0, 10))
 
         # Gesture States card
@@ -159,7 +167,7 @@ class GestureRecognitionApp:
         tk.Frame(gesture_card, height=6, bg="white").pack()
 
     # ──────────────────────────────────────────────
-    # Camera
+    # Camera (background thread — NO tkinter calls)
     # ──────────────────────────────────────────────
     def start_camera(self):
         if self.running:
@@ -168,6 +176,14 @@ class GestureRecognitionApp:
         if not self.cap.isOpened():
             print("Cannot open camera")
             return
+
+        # Set a fixed resolution so the feed is stable
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH,  640)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        self.cap.set(cv2.CAP_PROP_FPS, 30)
+        # Reduce internal buffer to 1 so we always get the freshest frame
+        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
         self.hands_model = self.mp_hands.Hands(
             max_num_hands=1,
             min_detection_confidence=0.7,
@@ -175,7 +191,7 @@ class GestureRecognitionApp:
         )
         self.running = True
         self.paused  = False
-        threading.Thread(target=self.update_frame, daemon=True).start()
+        threading.Thread(target=self._capture_loop, daemon=True).start()
 
     def toggle_pause(self):
         if not self.running:
@@ -214,8 +230,7 @@ class GestureRecognitionApp:
             tk.Label(row, text=label, font=("Arial", 9),
                      bg="white", width=28, anchor="w").pack(side="left")
             var = tk.StringVar(value=str(getattr(self, attr)))
-            entry = tk.Entry(row, textvariable=var, width=6,
-                             font=("Arial", 9))
+            entry = tk.Entry(row, textvariable=var, width=6, font=("Arial", 9))
             entry.pack(side="right")
             self.setting_vars[attr] = var
 
@@ -232,14 +247,12 @@ class GestureRecognitionApp:
                   padx=20, pady=6, command=apply).pack(pady=14)
 
     # ──────────────────────────────────────────────
-    # Distance & Gesture
+    # Distance & Gesture helpers
     # ──────────────────────────────────────────────
     def calc_distance_px(self, p1, p2):
         return math.hypot(p2[0] - p1[0], p2[1] - p1[1])
 
     def px_to_mm(self, px_dist, frame_width):
-        """Rough conversion using a reference focal length."""
-        # Average real finger-tip spread ~80mm when held ~400mm from camera
         REAL_WIDTH_MM = 80
         DISTANCE_MM   = 400
         scale = (self.focal_length * REAL_WIDTH_MM) / (DISTANCE_MM * frame_width)
@@ -248,25 +261,32 @@ class GestureRecognitionApp:
     def classify_gesture(self, dist_mm):
         if dist_mm > self.open_hand_dist:
             return "Open Hand"
-        elif self.pinch_dist_min <= dist_mm <= self.pinch_dist_max:
-            return "Pinch"
         elif dist_mm < self.closed_dist:
             return "Closed"
+        elif self.pinch_dist_min <= dist_mm <= self.pinch_dist_max:
+            return "Pinch"
         else:
             return "Pinch"   # in-between treated as pinch
 
     # ──────────────────────────────────────────────
-    # Frame loop
+    # Background capture loop — only image processing,
+    # NO tkinter calls whatsoever
     # ──────────────────────────────────────────────
-    def update_frame(self):
+    def _capture_loop(self):
+        TARGET_FPS   = 30
+        FRAME_DELAY  = 1.0 / TARGET_FPS
+
         while self.running:
+            loop_start = time.time()
+
             if self.paused:
-                time.sleep(0.03)
+                time.sleep(FRAME_DELAY)
                 continue
 
             ret, frame = self.cap.read()
             if not ret:
-                break
+                time.sleep(0.01)
+                continue
 
             frame = cv2.flip(frame, 1)
             h, w  = frame.shape[:2]
@@ -278,7 +298,6 @@ class GestureRecognitionApp:
 
             if result.multi_hand_landmarks:
                 for hand_lm in result.multi_hand_landmarks:
-                    # Draw landmarks
                     self.mp_draw.draw_landmarks(
                         frame, hand_lm,
                         self.mp_hands.HAND_CONNECTIONS,
@@ -286,20 +305,18 @@ class GestureRecognitionApp:
                         self.mp_draw.DrawingSpec(color=(180, 0, 255), thickness=2)
                     )
 
-                    lm = hand_lm.landmark
-                    thumb_tip = (int(lm[4].x * w),  int(lm[4].y * h))
-                    index_tip = (int(lm[8].x * w),  int(lm[8].y * h))
+                    lm        = hand_lm.landmark
+                    thumb_tip = (int(lm[4].x * w), int(lm[4].y * h))
+                    index_tip = (int(lm[8].x * w), int(lm[8].y * h))
 
-                    px_dist  = self.calc_distance_px(thumb_tip, index_tip)
-                    dist_mm  = int(self.px_to_mm(px_dist, w))
+                    px_dist       = self.calc_distance_px(thumb_tip, index_tip)
+                    dist_mm       = int(self.px_to_mm(px_dist, w))
                     gesture_label = self.classify_gesture(dist_mm)
 
-                    # Draw line between tips
                     cv2.line(frame, thumb_tip, index_tip, (200, 0, 255), 2)
                     cv2.circle(frame, thumb_tip, 6, (255, 20, 147), -1)
                     cv2.circle(frame, index_tip, 6, (255, 20, 147), -1)
 
-                    # Midpoint label
                     mid = ((thumb_tip[0] + index_tip[0]) // 2,
                            (thumb_tip[1] + index_tip[1]) // 2)
                     cv2.rectangle(frame,
@@ -311,36 +328,88 @@ class GestureRecognitionApp:
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.55,
                                 (255, 255, 255), 1, cv2.LINE_AA)
 
-                # Gesture label top-left
                 cv2.rectangle(frame, (8, 8), (160, 36), (80, 0, 120), -1)
                 cv2.putText(frame, gesture_label,
                             (14, 28), cv2.FONT_HERSHEY_SIMPLEX,
                             0.7, (255, 255, 255), 2, cv2.LINE_AA)
 
-            # Update UI
-            self.dist_var.set(str(dist_mm))
-            self.gesture_name = gesture_label
+            # Convert to PIL Image here (still in background thread — safe)
+            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            pil_img   = Image.fromarray(rgb_frame).resize((700, 460), Image.BILINEAR)
 
-            # Slider (re-enable briefly to set value)
-            self.dist_slider.config(state="normal")
-            self.dist_slider.set(min(dist_mm, 150))
-            self.dist_slider.config(state="disabled")
+            # Put result in queue; discard old frame if queue is full
+            payload = (pil_img, dist_mm, gesture_label)
+            try:
+                self.frame_queue.put_nowait(payload)
+            except queue.Full:
+                try:
+                    self.frame_queue.get_nowait()   # drop stale frame
+                except queue.Empty:
+                    pass
+                try:
+                    self.frame_queue.put_nowait(payload)
+                except queue.Full:
+                    pass
 
-            # Highlight active gesture row
-            self.highlight_gesture(gesture_label)
+            # Pace the loop to TARGET_FPS
+            elapsed = time.time() - loop_start
+            sleep_t = FRAME_DELAY - elapsed
+            if sleep_t > 0:
+                time.sleep(sleep_t)
 
-            # Render frame
-            img   = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-            img   = img.resize((700, 460))
-            imgtk = ImageTk.PhotoImage(image=img)
-            self.video_label.imgtk = imgtk
-            self.video_label.config(image=imgtk)
+        # Signal that the camera stopped
+        try:
+            self.frame_queue.put_nowait(None)
+        except queue.Full:
+            pass
 
-        self.video_label.config(image="", bg="black")
+    # ──────────────────────────────────────────────
+    # Main-thread UI refresh — scheduled via after()
+    # This is the ONLY place tkinter widgets are touched
+    # ──────────────────────────────────────────────
+    def _schedule_ui_update(self):
+        self._do_ui_update()
+        # Reschedule every 33 ms (~30 fps) on the main thread
+        self.root.after(33, self._schedule_ui_update)
 
+    def _do_ui_update(self):
+        try:
+            payload = self.frame_queue.get_nowait()
+        except queue.Empty:
+            return   # Nothing new — keep current frame displayed
+
+        if payload is None:
+            # Camera stopped; clear video label
+            self.video_label.config(image="", bg="black")
+            return
+
+        pil_img, dist_mm, gesture_label = payload
+
+        # Update video feed
+        imgtk = ImageTk.PhotoImage(image=pil_img)
+        self.video_label.imgtk = imgtk   # prevent garbage collection
+        self.video_label.config(image=imgtk)
+
+        # Update distance readout
+        self.dist_var.set(str(dist_mm))
+
+        # Update slider (always enabled — no state toggling)
+        self.dist_slider.set(min(dist_mm, 150))
+
+        # Highlight active gesture row
+        self.highlight_gesture(gesture_label)
+
+    # ──────────────────────────────────────────────
+    # Gesture highlight (main thread only)
+    # ──────────────────────────────────────────────
     def highlight_gesture(self, active):
-        colors = {"Open Hand": "#E8F5E9", "Pinch": "#FFF3E0",
-                  "Closed": "#FFEBEE", "No Hand": "white", "Unknown": "white"}
+        colors = {
+            "Open Hand": "#E8F5E9",
+            "Pinch":     "#FFF3E0",
+            "Closed":    "#FFEBEE",
+            "No Hand":   "white",
+            "Unknown":   "white",
+        }
         for name, row in self.gesture_rows.items():
             bg = colors.get(name, "white") if name == active else "white"
             for widget in row.winfo_children():
@@ -350,6 +419,7 @@ class GestureRecognitionApp:
                     pass
             row.config(bg=bg)
 
+    # ──────────────────────────────────────────────
     def on_close(self):
         self.stop_camera()
         self.root.destroy()
