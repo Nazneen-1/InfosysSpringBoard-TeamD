@@ -17,10 +17,10 @@ class GestureDistanceBackend:
         self._thread     = None
 
         # ── Gesture thresholds (mm) ──
-        self.open_hand_dist  = 80
-        self.pinch_dist_min  = 20
-        self.pinch_dist_max  = 60
-        self.closed_dist     = 20
+        self.open_hand_dist  = 50
+        self.pinch_dist_min  = 10
+        self.pinch_dist_max  = 50
+        self.closed_dist     = 10
         self.focal_length    = 800
 
         # ── Public state (frontend reads these) ──
