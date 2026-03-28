@@ -1,4 +1,3 @@
-# app.py
 import cv2
 import time
 import math
