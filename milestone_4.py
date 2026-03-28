@@ -1,4 +1,3 @@
-# milestone 4
 import tkinter as tk
 from tkinter import Frame, Label
 
