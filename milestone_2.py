@@ -17,10 +17,10 @@ class GestureDistanceBackend:
         self._thread     = None
 
         # ── Gesture thresholds (mm) ──
-        self.open_hand_dist  = 50
-        self.pinch_dist_min  = 10
-        self.pinch_dist_max  = 50
-        self.closed_dist     = 10
+        self.open_hand_dist  = 150
+        self.pinch_dist_min  = 60
+        self.pinch_dist_max  = 140
+        self.closed_dist     = 50
         self.focal_length    = 800
 
         # ── Public state (frontend reads these) ──
@@ -194,7 +194,7 @@ class GestureDistanceBackend:
                 index_tip = (int(lm[8].x * w), int(lm[8].y * h))
 
                 px_dist       = self._calc_distance_px(thumb_tip, index_tip)
-                dist_mm       = self._px_to_mm(px_dist, w)
+                dist_mm = int(px_dist)
                 gesture_label = self._classify_gesture(dist_mm)
 
             frame = self._annotate_frame(frame, result,
