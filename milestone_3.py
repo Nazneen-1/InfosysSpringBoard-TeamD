@@ -1,4 +1,3 @@
-# milestone 3
 import numpy as np
 import pyautogui
 from ctypes import cast, POINTER
